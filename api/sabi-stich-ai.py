@@ -4,105 +4,107 @@ import uuid
 import json
 from flask import Flask, request, jsonify, send_file
 from PIL import Image
-import mediapipe as mp
 import numpy as np
 import torch
 import google.generativeai as genai
 
-
+# ------------------- ENVIRONMENT -------------------
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-
+HF_TOKEN = os.environ.get("HUGGINGFACE_TOKEN")
 
 # ------------------- Flask App -------------------
 app = Flask(__name__)
 
-# ------------------- MediaPipe -------------------
-mp_pose = mp.solutions.pose
-POSE = mp_pose.Pose(static_image_mode=True)
+# ------------------- Gemini Client -------------------
+genai.configure(api_key=GEMINI_API_KEY)
 
-client = genai.configure(api_key=GEMINI_API_KEY)   # will be replaced
+# ------------------- MediaPipe Tasks -------------------
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+
+POSE_MODEL_PATH = "pose_landmarker_full.task"
+
+BaseOptions = python.BaseOptions
+PoseLandmarker = vision.PoseLandmarker
+PoseLandmarkerOptions = vision.PoseLandmarkerOptions
+
+pose_options = PoseLandmarkerOptions(
+    base_options=BaseOptions(model_asset_path=POSE_MODEL_PATH),
+    running_mode=vision.RunningMode.IMAGE
+)
+
+POSE = PoseLandmarker.create_from_options(pose_options)
 
 # ------------------- TryOnDiffusion Settings -------------------
 MODEL_ID = os.environ.get("TRYON_MODEL_ID", "Kotiko-ua/tryondiffusion-model")
-HF_TOKEN = os.environ.get("HUGGINGFACE_TOKEN")      # <<<<<<<<<< NEW
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 OUTPUT_DIR = "outputs"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-
-# --------------- TryOnDiffusion Pipeline Loader ----------------
+# ------------------- TryOnDiffusion Loader -------------------
 def load_tryon_pipeline(model_id=MODEL_ID, device=DEVICE):
     from diffusers import DiffusionPipeline
-    
+
     pipe = DiffusionPipeline.from_pretrained(
         model_id,
         torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-        use_auth_token=HF_TOKEN  # <<<<<<<<<<<<<< IMPORTANT
+        use_auth_token=HF_TOKEN
     )
 
     pipe.to(device)
     pipe.enable_attention_slicing()
     return pipe
 
-
 print("Loading TryOnDiffusion pipeline...")
 PIPELINE = load_tryon_pipeline()
 
-
-# ------------------- Helpers -------------------
+# ------------------- Helper Functions -------------------
 def read_imagefile(file_storage):
-    img = Image.open(io.BytesIO(file_storage.read())).convert("RGB")
-    return img
-
+    return Image.open(io.BytesIO(file_storage.read())).convert("RGB")
 
 def extract_landmarks(img: Image.Image):
-    img_np = np.array(img)
-    result = POSE.process(img_np)
-    if result.pose_landmarks:
-        return [
-            {
-                "x": lm.x,
-                "y": lm.y,
-                "z": lm.z,
-                "visibility": lm.visibility
-            } for lm in result.pose_landmarks.landmark
-        ]
-    return []
+    mp_img = vision.Image(image_format=vision.ImageFormat.SRGB, data=np.array(img))
+    result = POSE.detect(mp_img)
 
+    if not result.pose_landmarks:
+        return []
+
+    landmarks = []
+    for lm in result.pose_landmarks[0]:
+        landmarks.append({
+            "x": lm.x,
+            "y": lm.y,
+            "z": lm.z,
+            "visibility": lm.visibility
+        })
+
+    return landmarks
 
 def compute_pixel_distances(landmarks):
-    def distance(a, b):
-        return ((a['x']-b['x'])**2 + (a['y']-b['y'])**2)**0.5
+    def dist(a, b):
+        return ((a['x'] - b['x'])**2 + (a['y'] - b['y'])**2) ** 0.5
 
-    mp_landmark = mp.solutions.pose.PoseLandmark
     try:
-        shoulder_width = distance(landmarks[mp_landmark.LEFT_SHOULDER.value],
-                                  landmarks[mp_landmark.RIGHT_SHOULDER.value])
-        waist_width = distance(landmarks[mp_landmark.LEFT_HIP.value],
-                               landmarks[mp_landmark.RIGHT_HIP.value])
-        hip_width = waist_width
-        torso_height = distance(landmarks[mp_landmark.LEFT_SHOULDER.value],
-                                landmarks[mp_landmark.LEFT_HIP.value])
-        arm_length = distance(landmarks[mp_landmark.LEFT_SHOULDER.value],
-                              landmarks[mp_landmark.LEFT_WRIST.value])
-        leg_length = distance(landmarks[mp_landmark.LEFT_HIP.value],
-                              landmarks[mp_landmark.LEFT_ANKLE.value])
-    except Exception:
-        shoulder_width = waist_width = hip_width = torso_height = arm_length = leg_length = 0.0
+        shoulder = dist(landmarks[11], landmarks[12])
+        waist = dist(landmarks[23], landmarks[24])
+        hip = waist
+        torso = dist(landmarks[11], landmarks[23])
+        arm = dist(landmarks[11], landmarks[15])
+        leg = dist(landmarks[23], landmarks[27])
+    except:
+        shoulder = waist = hip = torso = arm = leg = 0
 
     return {
-        "shoulder_width_px": shoulder_width,
-        "waist_width_px": waist_width,
-        "hip_width_px": hip_width,
-        "torso_height_px": torso_height,
-        "arm_length_px": arm_length,
-        "leg_length_px": leg_length
+        "shoulder_width_px": shoulder,
+        "waist_width_px": waist,
+        "hip_width_px": hip,
+        "torso_height_px": torso,
+        "arm_length_px": arm,
+        "leg_length_px": leg,
     }
-
 
 # ------------------- Routes -------------------
 
-# ----- Measurements Route -----
 @app.route("/measurements", methods=["POST"])
 def measurements():
     if "front_image" not in request.files or "back_image" not in request.files:
@@ -111,54 +113,44 @@ def measurements():
     front_img = read_imagefile(request.files["front_image"])
     back_img = read_imagefile(request.files["back_image"])
 
-    front_landmarks = extract_landmarks(front_img)
-    back_landmarks = extract_landmarks(back_img)
+    front_lm = extract_landmarks(front_img)
+    back_lm = extract_landmarks(back_img)
 
-    if not front_landmarks or not back_landmarks:
-        return jsonify({"error": "Could not detect landmarks on one or both images"}), 400
+    if not front_lm or not back_lm:
+        return jsonify({"error": "Pose landmarks not detected"}), 400
 
-    front_pixels = compute_pixel_distances(front_landmarks)
-    back_pixels = compute_pixel_distances(back_landmarks)
+    front_px = compute_pixel_distances(front_lm)
+    back_px = compute_pixel_distances(back_lm)
 
-    combined_pixel_measurements = {
-        k: (front_pixels[k] + back_pixels[k]) / 2
-        for k in front_pixels
-    }
+    avg_px = {k: (front_px[k] + back_px[k]) / 2 for k in front_px}
 
-    GEMINI_PROMPT = f"""
-You are an AI system that estimates accurate human body measurements
-using two images (front and back) and raw pose landmarks from MediaPipe.
+    prompt = f"""
+You are an AI model converting pose landmarks and pixel distances into
+accurate human body measurements.
 
-Input JSONs:
-- mediapipe_landmarks_front: {json.dumps(front_landmarks)}
-- mediapipe_landmarks_back: {json.dumps(back_landmarks)}
-- pixel_measurements: {json.dumps(combined_pixel_measurements)}
+Front landmarks:
+{json.dumps(front_lm)}
 
-Task:
-1. Validate landmarks.
-2. Correct errors.
-3. Align front/back views.
-4. Convert pixel distances to centimeters.
-5. Return final JSON with:
-    height_cm, shoulder_width_cm, chest_circumference_cm, waist_cm, hip_cm,
-    inseam_cm, arm_length_cm, leg_length_cm, torso_length_cm,
-    scaling_factor_cm_per_pixel, quality_score, notes.
-Return ONLY JSON.
+Back landmarks:
+{json.dumps(back_lm)}
+
+Pixel distances:
+{json.dumps(avg_px)}
+
+Return ONLY a JSON object with:
+height_cm, shoulder_width_cm, chest_circumference_cm, waist_cm, hip_cm,
+inseam_cm, arm_length_cm, leg_length_cm, torso_length_cm,
+scaling_factor_cm_per_pixel, quality_score, notes.
 """
 
     try:
-        response = client.responses.create(
-            model="gemini-2.0-pro-vision",
-            input=GEMINI_PROMPT
-        )
-        measurements_json = json.loads(response.output_text)
+        response = genai.GenerativeModel("gemini-2.0-pro-vision").generate_content(prompt)
+        data = json.loads(response.text)
     except Exception as e:
-        return jsonify({"error": "Gemini API failed", "details": str(e)}), 500
+        return jsonify({"error": "Gemini failed", "details": str(e)}), 500
 
-    return jsonify(measurements_json)
+    return jsonify(data)
 
-
-# ----- Try-On Route -----
 @app.route("/tryon", methods=["POST"])
 def tryon():
     if "user_image" not in request.files or "cloth_image" not in request.files:
@@ -167,11 +159,8 @@ def tryon():
     user_img = read_imagefile(request.files["user_image"])
     cloth_img = read_imagefile(request.files["cloth_image"])
 
-    def resize_for_pipeline(img):
-        return img.resize((512, 1024), Image.LANCZOS)
-
-    user_img = resize_for_pipeline(user_img)
-    cloth_img = resize_for_pipeline(cloth_img)
+    user_img = user_img.resize((512, 1024), Image.LANCZOS)
+    cloth_img = cloth_img.resize((512, 1024), Image.LANCZOS)
 
     try:
         result = PIPELINE(
@@ -181,23 +170,20 @@ def tryon():
             num_inference_steps=30,
             guidance_scale=7.5
         )
-        out_img = result.images[0]
+        out = result.images[0]
     except Exception as e:
-        return jsonify({"error": "TryOnDiffusion failed", "details": str(e)}), 500
+        return jsonify({"error": "TryOnDiffusion error", "details": str(e)}), 500
 
-    out_name = f"{uuid.uuid4().hex}.png"
-    out_path = os.path.join(OUTPUT_DIR, out_name)
-    out_img.save(out_path)
+    fname = f"{uuid.uuid4().hex}.png"
+    fpath = os.path.join(OUTPUT_DIR, fname)
+    out.save(fpath)
 
-    return send_file(out_path, mimetype="image/png")
+    return send_file(fpath, mimetype="image/png")
 
-
-# ----- Health Route -----
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"ok": True, "device": DEVICE})
 
-
 # ------------------- Run -------------------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5000)

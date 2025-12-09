@@ -1,6 +1,6 @@
 flask
 pillow
-mediapipe
+mediapipe==0.10.14
 numpy
 torch
 torchvision
