@@ -11,3 +11,4 @@ transformers
 accelerate
 safetensors
 opencv-python
+gunicorn

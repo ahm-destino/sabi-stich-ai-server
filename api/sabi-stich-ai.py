@@ -13,9 +13,6 @@ import google.generativeai as genai
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 
-
-
-
 # ------------------- Flask App -------------------
 app = Flask(__name__)
 
