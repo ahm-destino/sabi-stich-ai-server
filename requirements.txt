@@ -1,0 +1,13 @@
+flask
+pillow
+mediapipe
+numpy
+torch
+torchvision
+torchaudio
+google-generativeai
+diffusers
+transformers
+accelerate
+safetensors
+opencv-python
