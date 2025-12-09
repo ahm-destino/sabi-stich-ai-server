@@ -7,50 +7,71 @@ from PIL import Image
 import mediapipe as mp
 import numpy as np
 import torch
-from openai import OpenAI  # i will  Replace this with Gemini client 
+import google.generativeai as genai
 
-# This is to start up my flask app
+
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
+
+
+
+
+# ------------------- Flask App -------------------
 app = Flask(__name__)
 
-# MediaPipe
+# ------------------- MediaPipe -------------------
 mp_pose = mp.solutions.pose
 POSE = mp_pose.Pose(static_image_mode=True)
 
-# Gemini client
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-client = OpenAI(api_key=GEMINI_API_KEY)  # RI will replace this with my gemini Api key
+client = genai.configure(api_key=GEMINI_API_KEY)   # will be replaced
 
-# TryOnDiffusion setup
+# ------------------- TryOnDiffusion Settings -------------------
 MODEL_ID = os.environ.get("TRYON_MODEL_ID", "Kotiko-ua/tryondiffusion-model")
+HF_TOKEN = os.environ.get("HUGGINGFACE_TOKEN")      # <<<<<<<<<< NEW
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 OUTPUT_DIR = "outputs"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Placeholder pipeline loader (diffusers-style)
+
+# --------------- TryOnDiffusion Pipeline Loader ----------------
 def load_tryon_pipeline(model_id=MODEL_ID, device=DEVICE):
     from diffusers import DiffusionPipeline
-    pipe = DiffusionPipeline.from_pretrained(model_id, torch_dtype=torch.float16 if device=="cuda" else torch.float32)
+    
+    pipe = DiffusionPipeline.from_pretrained(
+        model_id,
+        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+        use_auth_token=HF_TOKEN  # <<<<<<<<<<<<<< IMPORTANT
+    )
+
     pipe.to(device)
     pipe.enable_attention_slicing()
     return pipe
 
+
 print("Loading TryOnDiffusion pipeline...")
 PIPELINE = load_tryon_pipeline()
 
-# 
+
+# ------------------- Helpers -------------------
 def read_imagefile(file_storage):
     img = Image.open(io.BytesIO(file_storage.read())).convert("RGB")
     return img
+
 
 def extract_landmarks(img: Image.Image):
     img_np = np.array(img)
     result = POSE.process(img_np)
     if result.pose_landmarks:
-        landmarks = []
-        for lm in result.pose_landmarks.landmark:
-            landmarks.append({"x": lm.x, "y": lm.y, "z": lm.z, "visibility": lm.visibility})
-        return landmarks
+        return [
+            {
+                "x": lm.x,
+                "y": lm.y,
+                "z": lm.z,
+                "visibility": lm.visibility
+            } for lm in result.pose_landmarks.landmark
+        ]
     return []
+
 
 def compute_pixel_distances(landmarks):
     def distance(a, b):
@@ -81,10 +102,10 @@ def compute_pixel_distances(landmarks):
         "leg_length_px": leg_length
     }
 
-# This is where I called my flask routes
 
+# ------------------- Routes -------------------
 
-# This route is for the measurement
+# ----- Measurements Route -----
 @app.route("/measurements", methods=["POST"])
 def measurements():
     if "front_image" not in request.files or "back_image" not in request.files:
@@ -99,12 +120,12 @@ def measurements():
     if not front_landmarks or not back_landmarks:
         return jsonify({"error": "Could not detect landmarks on one or both images"}), 400
 
-    front_pixel = compute_pixel_distances(front_landmarks)
-    back_pixel = compute_pixel_distances(back_landmarks)
+    front_pixels = compute_pixel_distances(front_landmarks)
+    back_pixels = compute_pixel_distances(back_landmarks)
 
     combined_pixel_measurements = {
-        key: (front_pixel.get(key, 0) + back_pixel.get(key, 0))/2
-        for key in front_pixel.keys()
+        k: (front_pixels[k] + back_pixels[k]) / 2
+        for k in front_pixels
     }
 
     GEMINI_PROMPT = f"""
@@ -133,14 +154,14 @@ Return ONLY JSON.
             model="gemini-2.0-pro-vision",
             input=GEMINI_PROMPT
         )
-        result_text = response.output_text
-        measurements_json = json.loads(result_text)
+        measurements_json = json.loads(response.output_text)
     except Exception as e:
         return jsonify({"error": "Gemini API failed", "details": str(e)}), 500
 
     return jsonify(measurements_json)
 
-# This is the route for the outfit Try on model
+
+# ----- Try-On Route -----
 @app.route("/tryon", methods=["POST"])
 def tryon():
     if "user_image" not in request.files or "cloth_image" not in request.files:
@@ -149,14 +170,12 @@ def tryon():
     user_img = read_imagefile(request.files["user_image"])
     cloth_img = read_imagefile(request.files["cloth_image"])
 
-    # This is my preprocessing function: resize to 512x1024
     def resize_for_pipeline(img):
         return img.resize((512, 1024), Image.LANCZOS)
 
     user_img = resize_for_pipeline(user_img)
     cloth_img = resize_for_pipeline(cloth_img)
 
-    # Generate try-on image
     try:
         result = PIPELINE(
             prompt="",
@@ -175,11 +194,13 @@ def tryon():
 
     return send_file(out_path, mimetype="image/png")
 
-# healtth
+
+# ----- Health Route -----
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"ok": True, "device": DEVICE})
 
-# ---------------- Run ----------------
+
+# ------------------- Run -------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
